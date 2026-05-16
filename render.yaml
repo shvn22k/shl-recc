@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: shl-recommender
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: EMBEDDING_MODEL
+        value: all-MiniLM-L6-v2
+      - key: CATALOG_PATH
+        value: data/catalog.json
+      - key: INDEX_PATH
+        value: data/vector_index
+      - key: LOG_LEVEL
+        value: INFO
+      - key: MAX_TURNS
+        value: "8"
+      - key: MAX_RECOMMENDATIONS
+        value: "10"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "25"
+    healthCheckPath: /health

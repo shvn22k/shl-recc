@@ -1,0 +1,40 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Conda
+conda-meta/
+
+# IDE
+.antigravity/
+.cursor/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data — keep catalog.json and vector index committed
+# (they are built once and should be version controlled)
+# Do NOT add data/ to gitignore
+
+# Logs
+*.log
+logs/
