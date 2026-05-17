@@ -19,6 +19,8 @@ import logging
 import os
 
 from app.models import AgentDecision, Message, Recommendation, SlotState
+from app.prompts import build_slot_extractor_prompt
+from app.llm_client import call_llm_json, LLMError
 from app.guardrails import (
     enforce_url_whitelist,
     get_injection_refusal,
@@ -161,19 +163,58 @@ class ChatHandler:
 
     async def _extract_slots(self, messages: list[Message]) -> SlotState:
         """
-        STUB — Phase 4 replaces this with LLM Call 1 (Slot Extractor).
+        LLM Call 1 — Slot Extractor.
 
-        Reads the full conversation history and returns a populated SlotState
-        that drives all downstream decisions.
+        Reads the full conversation history and extracts structured intent
+        into a SlotState. Uses Gemini 2.5 Flash with JSON mode, falls back
+        to OpenAI GPT-4o-mini automatically.
+
+        The SlotState drives all downstream decisions:
+          needs_clarification  → return question, skip retrieval
+          ready_to_retrieve    → proceed to Phase 5 retrieval
+          is_comparison_turn   → return explanation, no new retrieval
+          end_of_conversation  → repeat shortlist, set end=true
+          explicit_additions/drops → honoured absolutely in Phase 6
         """
-        # Minimal stub: treat every request as needing clarification
-        return SlotState(
-            needs_clarification=True,
-            clarification_question=(
-                "Could you tell me more about the role and seniority level "
-                "you're hiring for?"
-            ),
-        )
+        system_prompt, user_prompt = build_slot_extractor_prompt(messages)
+
+        try:
+            raw = await call_llm_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1,
+            )
+            logger.debug(f"Slot extractor raw output: {raw}")
+        except LLMError as e:
+            logger.error(f"Slot extractor LLM call failed: {e}")
+            return SlotState(
+                needs_clarification=True,
+                clarification_question=(
+                    "I'm having trouble processing your request right now. "
+                    "Could you describe the role you're hiring for?"
+                ),
+            )
+        except ValueError as e:
+            logger.error(f"Slot extractor JSON parse failed: {e}")
+            return SlotState(
+                needs_clarification=True,
+                clarification_question=(
+                    "Could you tell me more about the role and level "
+                    "you're looking to assess?"
+                ),
+            )
+
+        try:
+            sanitised = _sanitise_slot_output(raw)
+            return SlotState(**sanitised)
+        except Exception as e:
+            logger.error(f"SlotState construction failed: {e}\nRaw: {raw}")
+            return SlotState(
+                needs_clarification=True,
+                clarification_question=(
+                    "What role are you hiring for, and what level of seniority?"
+                ),
+            )
 
     async def _retrieve_candidates(self, slots: SlotState) -> list:
         """
@@ -235,3 +276,72 @@ class ChatHandler:
                     test_type=item["test_type"],
                 ))
         return recs
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _sanitise_slot_output(raw: dict) -> dict:
+    """
+    Normalise the raw LLM JSON output before passing it to SlotState.
+
+    The LLM is instructed to return specific types and enum values, but
+    defensive parsing here protects against:
+      - Extra fields the LLM invented (stripped via explicit key selection)
+      - String "true"/"false" instead of bool True/False
+      - Invalid enum values (replaced with None so Pydantic doesn't reject)
+      - Missing fields (filled with safe defaults)
+    """
+    VALID_SENIORITY = {
+        "graduate", "entry-level", "mid-professional",
+        "senior-ic", "manager", "director", "executive",
+    }
+    VALID_PURPOSE = {"selection", "development", "screening", "audit", "reskilling"}
+    VALID_PHASE = {"clarifying", "recommending", "refining", "comparing", "closing"}
+    VALID_ACCENT = {"US", "UK", "AU", "IN"}
+    VALID_TIME = {"short", "normal"}
+    VALID_VOLUME = {"high", "normal"}
+
+    def to_bool(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        return bool(v)
+
+    def to_list_of_str(v) -> list:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(i) for i in v if i]
+        return []
+
+    def validated_enum(v, valid_set):
+        if v in valid_set:
+            return v
+        if isinstance(v, str) and v.lower() in valid_set:
+            return v.lower()
+        return None
+
+    return {
+        "role":                  raw.get("role") or None,
+        "seniority":             validated_enum(raw.get("seniority"), VALID_SENIORITY),
+        "purpose":               validated_enum(raw.get("purpose"), VALID_PURPOSE),
+        "industry":              raw.get("industry") or None,
+        "language":              raw.get("language") or None,
+        "accent_variant":        validated_enum(raw.get("accent_variant"), VALID_ACCENT),
+        "time_constraint":       validated_enum(raw.get("time_constraint"), VALID_TIME),
+        "volume":                validated_enum(raw.get("volume"), VALID_VOLUME),
+        "explicit_additions":    to_list_of_str(raw.get("explicit_additions")),
+        "explicit_drops":        to_list_of_str(raw.get("explicit_drops")),
+        "explicit_test_types":   to_list_of_str(raw.get("explicit_test_types")),
+        "current_shortlist_urls": to_list_of_str(raw.get("current_shortlist_urls")),
+        "conversation_phase":    validated_enum(raw.get("conversation_phase"), VALID_PHASE) or "clarifying",
+        "needs_clarification":   to_bool(raw.get("needs_clarification", True)),
+        "clarification_question": raw.get("clarification_question") or None,
+        "ready_to_retrieve":     to_bool(raw.get("ready_to_retrieve", False)),
+        "is_comparison_turn":    to_bool(raw.get("is_comparison_turn", False)),
+        "is_legal_question":     to_bool(raw.get("is_legal_question", False)),
+        "is_off_topic":          False,  # Always handled by guardrails, never by LLM
+        "end_of_conversation":   to_bool(raw.get("end_of_conversation", False)),
+    }
+
