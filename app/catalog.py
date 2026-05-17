@@ -14,6 +14,7 @@ import json
 import logging
 import numpy as np
 import faiss
+import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
@@ -105,7 +106,8 @@ class CatalogStore:
 
         # --- Embedding model ---
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        self.model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+        torch.set_num_threads(1)
         logger.info("Embedding model loaded")
 
         # --- URL whitelist ---
