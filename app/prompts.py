@@ -229,11 +229,114 @@ Expected output:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RANKER PROMPT — placeholder, implemented fully in Phase 6
+# RANKER PROMPT
+# Used in: app/agent.py — _rank_and_respond()
+# LLM Call 2 of 2 per request
+# Output: JSON with selected assessments + reply text
 # ══════════════════════════════════════════════════════════════════════════════
 
-RANKER_SYSTEM = "[Phase 6 — LLM Ranker system prompt will be implemented here]"
-RANKER_USER_TEMPLATE = "[Phase 6 — LLM Ranker user template will be implemented here]"
+RANKER_SYSTEM = """You are an expert SHL assessment advisor helping hiring managers select the right assessments.
+
+You will be given:
+1. A conversation history between a hiring manager and an advisor
+2. The structured hiring intent (slots) extracted from that conversation
+3. A list of candidate SHL assessments retrieved from the catalog
+
+Your job is to SELECT the best 1-10 assessments from the candidates and write a concise, expert reply.
+
+OUTPUT FORMAT — return exactly this JSON, no extra fields:
+{
+  "selected_assessments": [
+    {
+      "name": "exact name from the candidates list",
+      "url": "exact url from the candidates list",
+      "test_type": "exact test_type from the candidates list"
+    }
+  ],
+  "reply": "your response to the hiring manager",
+  "end_of_conversation": false
+}
+
+SELECTION RULES:
+
+1. SELECT ONLY from the provided candidates list — never invent assessments
+2. Use EXACT name, url, and test_type values from the candidates — do not paraphrase or modify
+3. Aim for 3–7 assessments. Expand to up to 10 when the role genuinely spans multiple domains
+4. When uncertain between more and fewer, choose MORE — breadth improves recall scoring
+5. Order matters: put the most critical assessment first
+
+DEFAULT INCLUSIONS — add these unless explicitly dropped by the user:
+- OPQ32r (Occupational Personality Questionnaire): include for any mid/senior SELECTION role
+  Exception: do NOT include for high-volume entry-level screening, or if user dropped it
+- Verify G+ (SHL Verify Interactive G+): include for GRADUATE and SENIOR-IC selection roles
+  Exception: do NOT include for executive/CXO roles (use OPQ32r focus instead), or if user dropped it
+
+EXPLICIT USER INSTRUCTIONS — these are ABSOLUTE, they override your judgment:
+- explicit_additions: these assessments MUST appear in selected_assessments (find them in candidates)
+- explicit_drops: these assessments MUST NOT appear in selected_assessments (remove by name match)
+- Honor add/drop instructions even if you think the assessment is a good or bad fit
+
+REPLY TONE AND STYLE — match the conversation traces exactly:
+- Terse and confident — no filler phrases like "Great question!" or "I'd be happy to help!"
+- Lead with the most important signal or distinction for this specific role
+- If you included OPQ32r proactively: mention it briefly with an opt-out offer ("say the word if you'd prefer to drop it")
+- If there's a relevant catalog constraint (e.g. no Rust-specific test): acknowledge it briefly
+- For refinement turns: state what changed ("Updated — REST out, AWS and Docker in:")
+- For first recommendations: brief framing sentence, then the list is implied by the JSON
+- Maximum 3 sentences in the reply — the table does the talking
+
+WHAT NOT TO DO:
+- Do not recommend Pre-packaged Job Solutions — only Individual Test Solutions
+- Do not invent URLs — only use URLs from the candidates list
+- Do not recommend more than 10 assessments
+- Do not explain psychometric theory — speak as a practitioner, not an academic
+- Do not ask clarifying questions in this reply — that is the slot extractor's job
+- Do not say "based on your requirements" or "I recommend" — just state what you've selected and why
+"""
+
+RANKER_USER_TEMPLATE = """CONVERSATION HISTORY:
+{conversation_text}
+
+HIRING INTENT (extracted slots):
+- Role: {role}
+- Seniority: {seniority}
+- Purpose: {purpose}
+- Industry: {industry}
+- Language preference: {language}
+- Time constraint: {time_constraint}
+- Volume: {volume}
+- Explicit test types requested: {explicit_test_types}
+- Assessments user asked to ADD: {explicit_additions}
+- Assessments user asked to DROP: {explicit_drops}
+- Conversation phase: {conversation_phase}
+
+CANDIDATE ASSESSMENTS FROM CATALOG (ranked by relevance):
+{candidates_text}
+
+Select the best assessments and write your reply. Return only valid JSON."""
+
+
+COMPARISON_SYSTEM = """You are an expert SHL assessment advisor.
+
+A hiring manager is asking you to compare or explain specific SHL assessments.
+Answer using ONLY the information provided in the assessment descriptions below.
+Do not use general psychometric knowledge — only what is in the catalog data.
+
+Rules:
+- Be specific and factual — cite actual differences from the descriptions
+- Distinguish between assessment INSTRUMENTS (what candidates complete) and REPORTS (what recruiters receive)
+- Be terse — 3-5 sentences maximum
+- Do not recommend dropping or adding assessments in your answer
+- Do not return a JSON object — return plain text only
+"""
+
+COMPARISON_USER_TEMPLATE = """CONVERSATION HISTORY:
+{conversation_text}
+
+RELEVANT ASSESSMENT DETAILS FROM CATALOG:
+{assessment_details}
+
+Answer the comparison or explanation question. Plain text only, no JSON."""
 
 
 # ── Prompt builder functions ──────────────────────────────────────────────────
@@ -267,3 +370,84 @@ def build_slot_extractor_prompt(messages) -> tuple[str, str]:
         + SLOT_EXTRACTOR_USER_TEMPLATE.format(conversation_text=conversation_text)
     )
     return SLOT_EXTRACTOR_SYSTEM, user_prompt
+
+
+def build_ranker_prompt(
+    messages,
+    slots: "SlotState",
+    candidates: list,
+) -> tuple[str, str]:
+    """
+    Build the system and user prompts for the LLM ranker.
+
+    Returns:
+        (system_prompt, user_prompt) tuple ready for call_llm_json()
+    """
+    conversation_text = format_conversation(messages)
+    candidates_text = _format_candidates(candidates)
+
+    user_prompt = RANKER_USER_TEMPLATE.format(
+        conversation_text=conversation_text,
+        role=slots.role or "not specified",
+        seniority=slots.seniority or "not specified",
+        purpose=slots.purpose or "not specified",
+        industry=slots.industry or "not specified",
+        language=slots.language or "English",
+        time_constraint=slots.time_constraint or "none",
+        volume=slots.volume or "normal",
+        explicit_test_types=", ".join(slots.explicit_test_types) or "none",
+        explicit_additions=", ".join(slots.explicit_additions) or "none",
+        explicit_drops=", ".join(slots.explicit_drops) or "none",
+        conversation_phase=slots.conversation_phase,
+        candidates_text=candidates_text,
+    )
+
+    return RANKER_SYSTEM, user_prompt
+
+
+def build_comparison_prompt(messages, assessment_details: str) -> tuple[str, str]:
+    """Build prompts for comparison/explanation turns."""
+    conversation_text = format_conversation(messages)
+    user_prompt = COMPARISON_USER_TEMPLATE.format(
+        conversation_text=conversation_text,
+        assessment_details=assessment_details,
+    )
+    return COMPARISON_SYSTEM, user_prompt
+
+
+def _format_candidates(candidates: list) -> str:
+    """
+    Format candidate assessments into a readable string for the ranker prompt.
+    Truncates descriptions to 200 chars to keep prompt length manageable.
+    """
+    if not candidates:
+        return "No candidates retrieved."
+
+    lines = []
+    for i, c in enumerate(candidates, 1):
+        desc = c.description if hasattr(c, "description") else c.get("description", "")
+        desc_short = desc[:200] + "..." if len(desc) > 200 else desc
+
+        name = c.name if hasattr(c, "name") else c.get("name", "")
+        url = c.url if hasattr(c, "url") else c.get("url", "")
+        test_type = c.test_type if hasattr(c, "test_type") else c.get("test_type", "")
+        test_type_label = (
+            c.test_type_label if hasattr(c, "test_type_label")
+            else c.get("test_type_label", "")
+        )
+        job_levels = c.job_levels if hasattr(c, "job_levels") else c.get("job_levels", [])
+        duration = c.duration if hasattr(c, "duration") else c.get("duration", "")
+        languages = c.languages if hasattr(c, "languages") else c.get("languages", [])
+
+        lines.append(
+            f"{i}. {name}\n"
+            f"   URL: {url}\n"
+            f"   Type: {test_type} ({test_type_label})\n"
+            f"   Job Levels: {', '.join(job_levels) if job_levels else 'General'}\n"
+            f"   Duration: {duration or 'Not specified'}\n"
+            f"   Languages: {', '.join(languages[:4]) if languages else 'Not specified'}"
+            f"{'...' if len(languages) > 4 else ''}\n"
+            f"   Description: {desc_short}"
+        )
+
+    return "\n\n".join(lines)

@@ -19,7 +19,8 @@ import logging
 import os
 
 from app.models import AgentDecision, Message, Recommendation, SlotState
-from app.prompts import build_slot_extractor_prompt
+from app.retriever import retrieve_candidates as _do_retrieve
+from app.prompts import build_slot_extractor_prompt, build_ranker_prompt, build_comparison_prompt
 from app.llm_client import call_llm_json, LLMError
 from app.guardrails import (
     enforce_url_whitelist,
@@ -218,13 +219,11 @@ class ChatHandler:
 
     async def _retrieve_candidates(self, slots: SlotState) -> list:
         """
-        STUB — Phase 5 replaces this with the hybrid retriever.
-
-        Applies metadata pre-filters (job level, test type) then runs
-        FAISS semantic search + BM25 keyword re-ranking.
-        Returns a list of CandidateAssessment objects.
+        Phase 5 — Hybrid retrieval.
+        Delegates to app/retriever.py which implements:
+        FAISS semantic search → metadata filter → BM25 re-rank → explicit injection
         """
-        return []
+        return await _do_retrieve(slots, self.catalog_store)
 
     async def _rank_and_respond(
         self,
@@ -233,33 +232,200 @@ class ChatHandler:
         candidates: list,
     ) -> AgentDecision:
         """
-        STUB — Phase 6 replaces this with LLM Call 2 (Ranker + Response).
+        Phase 6 — LLM Ranker (Call 2).
 
-        Selects the final 1-10 assessments from candidates using chain-of-thought
-        reasoning and generates a grounded, conversational reply.
+        Selects final 1-10 assessments from candidates using chain-of-thought
+        reasoning. Applies explicit_drops as a post-processing step.
         """
+        from app.llm_client import call_llm_json, call_llm, LLMError
+        from app.models import Recommendation
+
+        # Edge case: no candidates retrieved
+        if not candidates:
+            return AgentDecision(
+                reply=(
+                    "I wasn't able to find specific assessments matching those "
+                    "criteria in the SHL catalog. Could you tell me more about "
+                    "the role or the skills you need to assess?"
+                ),
+                recommendations=[],
+                end_of_conversation=False,
+            )
+
+        system_prompt, user_prompt = build_ranker_prompt(messages, slots, candidates)
+
+        try:
+            raw = await call_llm_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.2,  # Slightly higher than extractor — allows nuanced selection
+            )
+        except LLMError as e:
+            logger.error(f"Ranker LLM call failed: {e}")
+            # Fallback: return top-5 candidates directly without LLM selection
+            fallback_recs = []
+            for c in candidates[:5]:
+                fallback_recs.append(Recommendation(
+                    name=c.name,
+                    url=c.url,
+                    test_type=c.test_type,
+                ))
+            return AgentDecision(
+                reply=(
+                    "Here are the most relevant assessments I found for your needs."
+                ),
+                recommendations=fallback_recs,
+                end_of_conversation=False,
+            )
+
+        # Parse ranker output
+        try:
+            selected_raw = raw.get("selected_assessments", [])
+            reply = raw.get("reply", "").strip()
+            end_conv = bool(raw.get("end_of_conversation", False))
+
+            if not reply:
+                reply = "Here are the assessments I recommend for this role."
+
+            # Build Recommendation objects from ranker output
+            # Validate each against candidates to prevent URL hallucination
+            candidate_url_map = {
+                (c.name if hasattr(c, "name") else c.get("name", "")).lower(): c
+                for c in candidates
+            }
+            candidate_urls = {
+                c.url if hasattr(c, "url") else c.get("url", "")
+                for c in candidates
+            }
+
+            recommendations = []
+            seen_urls = set()
+
+            for item in selected_raw:
+                name = item.get("name", "").strip()
+                url = item.get("url", "").strip()
+                test_type = item.get("test_type", "").strip()
+
+                # Skip duplicates
+                if url in seen_urls:
+                    continue
+
+                # Validate URL is from candidates or catalog whitelist
+                if url not in candidate_urls:
+                    # Try to find the correct URL from catalog by name
+                    match = self.catalog_store.get_by_name(name)
+                    if match:
+                        url = match["url"]
+                        test_type = match["test_type"]
+                        logger.warning(
+                            f"Ranker returned wrong URL for '{name}', "
+                            f"corrected to catalog URL"
+                        )
+                    else:
+                        logger.error(
+                            f"Ranker hallucinated assessment not in candidates: "
+                            f"name='{name}' url='{url}' — skipping"
+                        )
+                        continue
+
+                # Apply explicit_drops — remove if name matches any drop term
+                if self._should_drop(name, slots.explicit_drops):
+                    logger.info(f"Dropping '{name}' per explicit_drops instruction")
+                    continue
+
+                if not name or not url or not test_type:
+                    continue
+
+                recommendations.append(Recommendation(
+                    name=name,
+                    url=url,
+                    test_type=test_type,
+                ))
+                seen_urls.add(url)
+
+                if len(recommendations) >= 10:
+                    break
+
+        except Exception as e:
+            logger.error(f"Failed to parse ranker output: {e}\nRaw: {raw}")
+            recommendations = []
+            reply = "I found relevant assessments but encountered an issue formatting them. Please try again."
+            end_conv = False
+
         return AgentDecision(
-            reply=(
-                "I've found some relevant assessments for your needs. "
-                "Full recommendations are coming in the next implementation phase."
-            ),
-            recommendations=[],
-            end_of_conversation=False,
+            reply=reply,
+            recommendations=recommendations,
+            end_of_conversation=end_conv,
         )
 
     async def _handle_comparison(
         self, messages: list[Message], slots: SlotState
     ) -> str:
         """
-        STUB — Phase 6 replaces this with grounded comparison logic.
+        Phase 6 — Comparison handler.
 
-        Answers "what's the difference between X and Y?" using catalog data,
-        without returning new recommendations.
+        Fetches the relevant assessments from the catalog by URL
+        (from current_shortlist_urls) and answers the comparison
+        question grounded in catalog data only.
+
+        Returns plain text reply. recommendations=[] on comparison turns.
         """
-        return (
-            "I can walk you through the differences between those assessments. "
-            "Full comparison logic is coming in the next implementation phase."
-        )
+        from app.llm_client import call_llm, LLMError
+
+        # Gather details for assessments currently in the shortlist
+        assessment_details_parts = []
+        urls_to_fetch = slots.current_shortlist_urls or []
+
+        # If no shortlist URLs, try fetching the two most recently mentioned names
+        # from the conversation (the LLM will figure it out from context)
+        for url in urls_to_fetch[:6]:  # Cap at 6 to keep prompt manageable
+            item = self.catalog_store.get_by_url(url)
+            if item:
+                desc = item.get("description", "")[:400]
+                assessment_details_parts.append(
+                    f"Assessment: {item['name']}\n"
+                    f"Type: {item['test_type']} ({item.get('test_type_label', '')})\n"
+                    f"Duration: {item.get('duration', 'Not specified')}\n"
+                    f"Job Levels: {', '.join(item.get('job_levels', [])) or 'General'}\n"
+                    f"Description: {desc}"
+                )
+
+        assessment_details = "\n\n---\n\n".join(assessment_details_parts)
+        if not assessment_details:
+            assessment_details = "No specific assessment details available for comparison."
+
+        system_prompt, user_prompt = build_comparison_prompt(messages, assessment_details)
+
+        try:
+            reply = await call_llm(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_mode=False,  # Plain text for comparison answers
+                temperature=0.2,
+            )
+            return reply.strip()
+        except LLMError as e:
+            logger.error(f"Comparison LLM call failed: {e}")
+            return (
+                "I can help compare those assessments. "
+                "Both are available in the SHL catalog — "
+                "could you clarify what specific dimension you'd like to compare?"
+            )
+
+    @staticmethod
+    def _should_drop(name: str, explicit_drops: list[str]) -> bool:
+        """
+        Check if an assessment name matches any explicit drop instruction.
+        Case-insensitive, partial match allowed.
+        """
+        if not explicit_drops:
+            return False
+        name_lower = name.lower()
+        for drop_term in explicit_drops:
+            drop_lower = drop_term.lower()
+            if drop_lower in name_lower or name_lower in drop_lower:
+                return True
+        return False
 
     async def _get_current_recommendations(self, slots: SlotState) -> list[Recommendation]:
         """
