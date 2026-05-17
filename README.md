@@ -15,6 +15,17 @@ Built by [Shiven Shandil](https://github.com/shvn22k) as a hiring assessment for
 
 ---
 
+## Live API
+
+**Endpoint:** `https://shl-recc.onrender.com`
+
+| Route | Method | Description |
+|---|---|---|
+| `/health` | GET | Readiness probe — returns `{"status":"ok"}` |
+| `/chat` | POST | Conversational assessment recommendation |
+
+---
+
 ## What It Does
 
 Give it a hiring need in plain English. It asks the right questions, then recommends the exact SHL assessments from the product catalog — grounded, specific, and explainable.
@@ -233,7 +244,7 @@ C10 Graduate management trainee ████████████  0.67
 ## Project Structure
 
 ```
-shl-recommender/
+shl-recc/
 ├── app/
 │   ├── main.py          # FastAPI app, lifespan handler, endpoints
 │   ├── models.py        # Pydantic schema (API contract + internal types)
@@ -390,6 +401,20 @@ See [`docs/APPROACH.md`](docs/APPROACH.md) for the full technical approach docum
 - Challenges encountered and how they were fixed
 - Evaluation results analysis
 - What would improve with more time
+
+---
+
+## Development Phases
+
+- [x] Phase 0: Scaffold & environment
+- [x] Phase 1: Catalog scraper (377 Individual Test Solutions)
+- [x] Phase 2: Embedding pipeline (FAISS + MiniLM)
+- [x] Phase 3: FastAPI core + schema enforcement
+- [x] Phase 4: Slot extractor + agent logic
+- [x] Phase 5+6: Hybrid retriever + LLM ranker
+- [x] Phase 7+8: Guardrails + full test suite (45/45 passing)
+- [x] Phase 9: Deployment (Render.com)
+- [x] Phase 10: README + repo finalized
 
 ---
 
