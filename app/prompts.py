@@ -1,9 +1,15 @@
 """
-Prompts for the SHL Assessment Recommender.
+All LLM prompts for the SHL Assessment Recommender.
 
-All LLM prompts live here as module-level constants.
-Never scatter prompt strings across other files — centralised here so
-they can be reviewed, versioned, and tuned in one place.
+Keeping prompts in one place allows systematic review and tuning without
+touching business logic. Every prompt function returns a (system, user) tuple
+ready for call_llm() or call_llm_json().
+
+Prompt inventory:
+  SLOT_EXTRACTOR_SYSTEM / USER_TEMPLATE  — intent extraction (LLM Call 1)
+  RANKER_SYSTEM / USER_TEMPLATE          — assessment selection (LLM Call 2)
+  COMPARISON_SYSTEM / USER_TEMPLATE      — grounded comparison answers
+  SLOT_EXTRACTOR_EXAMPLES                — 7 few-shot examples for the extractor
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -74,7 +80,10 @@ RULES FOR conversation_phase:
 - "clarifying": still gathering information
 
 RULES FOR explicit_additions and explicit_drops:
-- explicit_additions: ONLY populate if the user used language like "add X", "include X", "also add", "can you add"
+- explicit_additions: populate when the user explicitly names specific tools, technologies, or assessments they want tested, using ANY of these patterns:
+  - "add X", "include X", "also add", "can you add"
+  - "for X", "to test X", "screen for X", "assess them on X", "check their X skills" — when X is a named tool or technology (e.g. "screen for Excel and Word" → ["Excel", "Word"])
+  - The initial request itself when it names specific tools: "screen admin assistants for Excel and Word" → explicit_additions: ["Excel", "Word"]
 - explicit_drops: ONLY populate if the user used language like "drop X", "remove X", "exclude X", "without X", "don't include X"
 - These are ABSOLUTE instructions that override the agent's judgment
 - Include both the specific name mentioned AND common synonyms (e.g. "REST" → ["REST", "RESTful Web Services"])
@@ -90,6 +99,24 @@ RULES FOR end_of_conversation:
 - Closing phrases: "confirmed", "that's what we need", "perfect, that's it", "locking it in", "that covers it"
 - A simple "thanks" or "good" mid-conversation is NOT end_of_conversation
 - When end_of_conversation=true, also set conversation_phase="closing"
+- When end_of_conversation=true, you MUST set is_comparison_turn=false
+
+RULES FOR is_comparison_turn:
+- Set true ONLY on the turn where the user asks a comparison question ("difference between", "vs", "compare")
+- Set false on refining, closing, or confirmation turns — even if the prior turn was a comparison
+- "Confirmed", "clear", "keep the shortlist", "final list" are NEVER comparison turns
+
+RULES FOR is_legal_question:
+- Always return false in JSON — legal questions are handled by guardrails before you run
+- Do not set needs_clarification=true just because HIPAA or GDPR was mentioned earlier in the thread
+
+RULES FOR post-legal and continuation turns:
+- After the user acknowledges a legal refusal ("understood", "keep the shortlist", "as-is"), set needs_clarification=false and ready_to_retrieve=true
+- Re-populate current_shortlist_urls from the last assistant [Shortlist: ...] footer or prior recommendations
+
+RULES FOR current_shortlist_urls (additional):
+- Look for a line containing "[Shortlist: url1, url2, ...]" in assistant messages — parse those URLs exactly
+- On refining/closing turns, carry forward ALL URLs from the most recent non-empty shortlist unless the user explicitly dropped one
 
 SENIORITY MAPPING — interpret these user phrases:
 - "graduate", "fresh grad", "final year", "no experience", "entry" → "graduate" or "entry-level"
@@ -206,7 +233,46 @@ Expected output:
   "time_constraint": null, "volume": null, "is_legal_question": false
 }
 
-Example 5 — User confirms they are done → closing turn:
+Example 5 — Multi-technology JD with 5+ distinct tech terms → ask backend vs frontend clarification:
+User: "Here's the JD for an engineer we need to fill: Senior Full-Stack Engineer — Core Java, Spring, REST API, Angular, SQL, AWS, Docker. Can you recommend a battery?"
+Expected output:
+{
+  "role": "full-stack engineer",
+  "seniority": "senior-ic",
+  "purpose": "selection",
+  "needs_clarification": true,
+  "clarification_question": "Is this role primarily backend (Java / Spring / SQL heavy) or more balanced full-stack with significant Angular front-end work? That determines whether we lead with knowledge tests or add a front-end layer.",
+  "ready_to_retrieve": false,
+  "conversation_phase": "clarifying",
+  "explicit_additions": [], "explicit_drops": [], "explicit_test_types": [],
+  "current_shortlist_urls": [], "end_of_conversation": false,
+  "is_comparison_turn": false, "is_legal_question": false,
+  "industry": "information technology", "language": null, "accent_variant": null,
+  "time_constraint": null, "volume": null
+}
+
+Example 6 — Initial request names specific tools → capture as explicit_additions, no clarification:
+User: "I need to quickly screen admin assistants for Excel and Word daily."
+Expected output:
+{
+  "role": "admin assistant",
+  "seniority": null,
+  "purpose": "screening",
+  "explicit_additions": ["Excel", "Word"],
+  "explicit_test_types": [],
+  "explicit_drops": [],
+  "time_constraint": "short",
+  "needs_clarification": false,
+  "clarification_question": null,
+  "ready_to_retrieve": true,
+  "conversation_phase": "recommending",
+  "current_shortlist_urls": [],
+  "end_of_conversation": false,
+  "is_comparison_turn": false, "is_legal_question": false,
+  "industry": null, "language": null, "accent_variant": null, "volume": null
+}
+
+Example 7 — User confirms they are done → closing turn:
 User: "Perfect — that's what we need."
 Expected output:
 {
@@ -292,6 +358,24 @@ WHAT NOT TO DO:
 - Do not explain psychometric theory — speak as a practitioner, not an academic
 - Do not ask clarifying questions in this reply — that is the slot extractor's job
 - Do not say "based on your requirements" or "I recommend" — just state what you've selected and why
+- ALWAYS set end_of_conversation to false — the conversation lifecycle is managed externally; the ranker never ends the conversation
+
+CATALOG GAP HANDLING — when the specific technology has no dedicated SHL test:
+- Acknowledge the gap briefly in your reply: "SHL's catalog doesn't currently include a [Tech]-specific test."
+- Pivot to the closest proxy assessments available in the candidates:
+  * For systems/low-level languages (Rust, C++, Go): use Linux Programming, Networking and Implementation, Smart Interview Live Coding
+  * For any programming language gap: use Smart Interview Live Coding (adaptive, panel can set language-specific tasks)
+  * For cloud platforms not in catalog: use the closest available cloud/infrastructure test
+- Include Verify G+ for senior IC roles as the cognitive signal when domain test is missing
+- Include OPQ32r as the personality signal (default for senior selection)
+- Still aim for 4-6 recommendations even when the primary tech is missing
+
+SENIORITY-AWARE SELECTION:
+- Graduate: prefer tests tagged Graduate in job levels, include Graduate Scenarios for SJT
+- Entry-level: prefer shorter tests, volume-screening tools, avoid executive-level instruments  
+- Senior-IC: prefer Advanced-level variants (e.g. Core Java Advanced not Entry), include Verify G+
+- Manager: add leadership-framing report variants if available (OPQ Leadership Report)
+- Executive/CXO: ALWAYS include OPQ32r (the personality instrument), OPQ Leadership Report, and OPQ Universal Competency Report 2.0; skip domain knowledge tests; these three form the standard executive selection battery
 """
 
 RANKER_USER_TEMPLATE = """CONVERSATION HISTORY:
@@ -341,7 +425,7 @@ Answer the comparison or explanation question. Plain text only, no JSON."""
 
 # ── Prompt builder functions ──────────────────────────────────────────────────
 
-def format_conversation(messages) -> str:
+def format_conversation(messages: list) -> str:
     """
     Format a list of Message objects into a clean, readable conversation string
     for injection into prompts.
@@ -353,11 +437,11 @@ def format_conversation(messages) -> str:
     return "\n\n".join(lines)
 
 
-def build_slot_extractor_prompt(messages) -> tuple[str, str]:
+def build_slot_extractor_prompt(messages: list) -> tuple[str, str]:
     """
     Build the (system_prompt, user_prompt) tuple for the slot extractor LLM call.
 
-    Injects five few-shot examples into the user prompt to anchor the model
+    Injects seven few-shot examples into the user prompt to anchor the model
     on the expected output structure and edge case handling.
 
     Returns:
@@ -373,7 +457,7 @@ def build_slot_extractor_prompt(messages) -> tuple[str, str]:
 
 
 def build_ranker_prompt(
-    messages,
+    messages: list,
     slots: "SlotState",
     candidates: list,
 ) -> tuple[str, str]:
@@ -405,7 +489,7 @@ def build_ranker_prompt(
     return RANKER_SYSTEM, user_prompt
 
 
-def build_comparison_prompt(messages, assessment_details: str) -> tuple[str, str]:
+def build_comparison_prompt(messages: list, assessment_details: str) -> tuple[str, str]:
     """Build prompts for comparison/explanation turns."""
     conversation_text = format_conversation(messages)
     user_prompt = COMPARISON_USER_TEMPLATE.format(

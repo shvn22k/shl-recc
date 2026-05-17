@@ -1,21 +1,16 @@
 """
 LLM client for the SHL Assessment Recommender.
 
-Provides a single async interface `call_llm()` that:
-  - Tries Gemini 2.5 Flash first (fast, capable, free-tier friendly)
-  - Falls back to OpenAI GPT-4o-mini on any Gemini failure
-  - Enforces JSON mode when requested (no markdown wrapping, pure parseable JSON)
-  - Retries with exponential backoff on transient errors
-  - Raises LLMError if both providers fail after retries
+Provides a unified async interface over two providers:
+  Primary:  Google Gemini 2.5 Flash  — fast, generous context window
+  Fallback: OpenAI GPT-4o-mini       — reliable, predictable latency
 
-Usage:
-    from app.llm_client import call_llm, call_llm_json
+Both providers support JSON mode (response_mime_type / response_format),
+which is used for all structured extraction calls to guarantee parseable output.
 
-    # Plain text response
-    text = await call_llm(system_prompt, user_prompt)
-
-    # Structured JSON response (parsed to dict)
-    data = await call_llm_json(system_prompt, user_prompt)
+Retry logic uses tenacity with exponential backoff. If the primary provider
+fails after 2 attempts, the fallback is tried automatically. LLMError is
+raised only if both providers fail.
 """
 
 import asyncio

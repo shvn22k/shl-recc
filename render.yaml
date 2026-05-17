@@ -10,9 +10,9 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: LLM_PROVIDER
-        value: gemini
+        value: openai
       - key: GEMINI_MODEL
-        value: gemini-2.0-flash
+        value: gemini-2.5-flash
       - key: OPENAI_MODEL
         value: gpt-4o-mini
       - key: EMBEDDING_MODEL

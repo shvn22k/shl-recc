@@ -1,14 +1,17 @@
 """
-Hybrid retriever for SHL Assessment Recommender.
+Hybrid retrieval for the SHL Assessment Recommender.
 
 Implements the retrieval stage of CSG-RAG:
-  1. Query construction from SlotState
-  2. FAISS semantic search (top-40 candidates)
-  3. Metadata pre-filter (job level, test type preferences)
-  4. BM25 keyword re-rank
-  5. Direct lookup for explicit_additions
 
-Returns a ranked list of CandidateAssessment objects for the LLM ranker.
+  1. Query construction  — builds a semantic query from structured slot state
+  2. FAISS search        — top-40 candidates by cosine similarity
+  3. Metadata filter     — job level filter for graduate/entry-level roles only
+  4. BM25 re-rank        — boosts exact keyword matches (critical for tech roles)
+  5. Explicit injection  — user-requested additions bypass retrieval scoring
+
+The job level filter is intentionally restricted to graduate and entry-level
+seniorities. Senior and above roles have sparse job level metadata in the SHL
+catalog, and filtering aggressively eliminates valid technical knowledge tests.
 """
 
 import logging
@@ -30,65 +33,108 @@ def build_retrieval_query(slots: SlotState) -> str:
     """
     Build a natural language query string from the SlotState.
 
-    This string is embedded and used for FAISS semantic search.
-    The order of components matters — earlier terms have slightly
-    more influence on the embedding.
-
-    Strategy:
-    - Lead with role + seniority (most discriminating)
-    - Add explicit test type preferences
-    - Add industry/domain context
-    - Add purpose framing
-    - Add constraint signals
+    Strategy differs by role type:
+    - Tech/knowledge roles: lead with domain keywords + "knowledge test"
+      so FAISS surfaces coding/technical assessments first
+    - Non-tech roles: lead with role + seniority framing
     """
     parts = []
 
-    # Core identity — role + seniority
-    if slots.role:
-        parts.append(slots.role)
-    if slots.seniority:
-        seniority_phrases = {
-            "graduate": "graduate entry level recent graduate",
-            "entry-level": "entry level junior",
-            "mid-professional": "mid level professional",
-            "senior-ic": "senior individual contributor experienced",
-            "manager": "manager team lead people manager",
-            "director": "director head of department senior leader",
-            "executive": "executive CXO C-suite senior leadership",
+    # Detect if this is a tech/knowledge role — check role AND explicit_additions
+    # so "screen for Excel and Word" surfaces the right assessments even when the
+    # LLM extracts role="admin assistant" without the tool names embedded.
+    tech_keywords = extract_tech_keywords(slots.role or "")
+    for addition in slots.explicit_additions:
+        tech_keywords.extend(extract_tech_keywords(addition))
+    tech_keywords = list(dict.fromkeys(tech_keywords))  # deduplicate, preserve order
+    is_tech_role = len(tech_keywords) > 0
+
+    if is_tech_role:
+        # For tech roles: domain keywords first, then "knowledge skills test"
+        # This anchors the embedding in the technical assessment space
+        parts.extend(tech_keywords)
+        if slots.role:
+            parts.append(slots.role)
+        parts.append("knowledge skills technical assessment programming")
+
+        # Add explicit test type preferences
+        test_type_phrases = {
+            "cognitive": "cognitive ability reasoning",
+            "personality": "personality behavior OPQ",
+            "situational-judgment": "situational judgment SJT",
+            "knowledge": "knowledge skills domain specific test",
+            "simulation": "simulation work sample",
+            "behavioral": "behavioral competency",
         }
-        parts.append(seniority_phrases.get(slots.seniority, slots.seniority))
+        for tt in slots.explicit_test_types:
+            if tt in test_type_phrases:
+                parts.append(test_type_phrases[tt])
 
-    # Explicit test type preferences
-    test_type_phrases = {
-        "cognitive": "cognitive ability reasoning numerical verbal inductive",
-        "personality": "personality behavior workplace OPQ",
-        "situational-judgment": "situational judgment SJT scenarios",
-        "knowledge": "knowledge skills technical domain specific",
-        "simulation": "simulation realistic job preview work sample",
-        "behavioral": "behavioral competency assessment",
-    }
-    for tt in slots.explicit_test_types:
-        if tt in test_type_phrases:
-            parts.append(test_type_phrases[tt])
+        # Seniority appended after domain (less influential position)
+        if slots.seniority:
+            seniority_phrases = {
+                "graduate": "graduate entry level",
+                "entry-level": "entry level junior",
+                "mid-professional": "mid level professional",
+                "senior-ic": "senior advanced expert",
+                "manager": "manager lead",
+                "director": "director senior",
+                "executive": "executive leadership",
+            }
+            parts.append(seniority_phrases.get(slots.seniority, slots.seniority))
 
-    # Industry / domain
-    if slots.industry:
-        parts.append(slots.industry)
+    else:
+        # For non-tech roles: role + seniority first, then purpose/domain
+        if slots.role:
+            parts.append(slots.role)
 
-    # Purpose framing
-    purpose_phrases = {
-        "selection": "hiring selection assessment battery",
-        "development": "development feedback coaching growth",
-        "screening": "high volume screening filter",
-        "audit": "talent audit review workforce assessment",
-        "reskilling": "reskilling upskilling development learning",
-    }
-    if slots.purpose:
-        parts.append(purpose_phrases.get(slots.purpose, slots.purpose))
+        if slots.seniority:
+            seniority_phrases = {
+                "graduate": "graduate entry level recent graduate",
+                "entry-level": "entry level junior",
+                "mid-professional": "mid level professional",
+                "senior-ic": "senior individual contributor experienced",
+                "manager": "manager team lead people manager",
+                "director": "director head of department senior leader",
+                "executive": "executive CXO C-suite senior leadership",
+            }
+            parts.append(seniority_phrases.get(slots.seniority, slots.seniority))
 
-    # Language constraint
-    if slots.language and slots.language.lower() != "english":
-        parts.append(f"{slots.language} language assessment")
+        # Explicit test type preferences
+        test_type_phrases = {
+            "cognitive": "cognitive ability reasoning numerical verbal inductive",
+            "personality": "personality behavior workplace OPQ",
+            "situational-judgment": "situational judgment SJT scenarios",
+            "knowledge": "knowledge skills technical domain specific",
+            "simulation": "simulation realistic job preview work sample",
+            "behavioral": "behavioral competency assessment",
+        }
+        for tt in slots.explicit_test_types:
+            if tt in test_type_phrases:
+                parts.append(test_type_phrases[tt])
+
+        # Industry / domain
+        if slots.industry:
+            parts.append(slots.industry)
+
+        # Purpose framing
+        purpose_phrases = {
+            "selection": "hiring selection assessment battery",
+            "development": "development feedback coaching growth",
+            "screening": "high volume screening filter",
+            "audit": "talent audit review workforce assessment",
+            "reskilling": "reskilling upskilling development learning",
+        }
+        if slots.purpose:
+            parts.append(purpose_phrases.get(slots.purpose, slots.purpose))
+
+    # NOTE: language is intentionally excluded from the FAISS query.
+    # Including it (e.g. "Spanish language assessment") overweights language-
+    # proficiency tests and crowds out the domain-specific tools that are the
+    # primary signal for most roles (e.g. HIPAA, Medical Terminology for a
+    # bilingual healthcare-admin hire).  The ranker sees slots.language in its
+    # prompt and can select language-appropriate catalog variants from the
+    # correctly-surfaced domain candidates.
 
     # Time constraint
     if slots.time_constraint == "short":
@@ -99,7 +145,7 @@ def build_retrieval_query(slots: SlotState) -> str:
         parts.append("high volume screening large scale")
 
     query = " ".join(parts)
-    logger.debug(f"Retrieval query: '{query}'")
+    logger.debug(f"Retrieval query (tech_role={is_tech_role}): '{query}'")
     return query
 
 
@@ -198,7 +244,7 @@ def extract_tech_keywords(role: str) -> list[str]:
 
 async def retrieve_candidates(
     slots: SlotState,
-    catalog_store,
+    catalog_store: "CatalogStore",
 ) -> list[CandidateAssessment]:
     """
     Main retrieval function. Implements the full hybrid pipeline.
@@ -212,7 +258,7 @@ async def retrieve_candidates(
     6. Return top-20 as CandidateAssessment objects
 
     Args:
-        slots: Populated SlotState from Phase 4
+        slots: Populated SlotState from the slot extractor
         catalog_store: The CatalogStore singleton
 
     Returns:
@@ -229,11 +275,16 @@ async def retrieve_candidates(
     # ── Step 3: Metadata pre-filter ──────────────────────────────────────────
     filtered = raw_candidates
 
-    # Job level filter (with synonym expansion built into CatalogStore)
-    if slots.seniority:
+    # Job level filter — only apply for graduate and entry-level
+    # For senior+ roles, most technical knowledge tests have no job level set,
+    # so filtering by level eliminates valid candidates. Ranker handles seniority
+    # framing via prompt instructions instead.
+    LEVEL_FILTER_APPLICABLE = {"graduate", "entry-level"}
+    if slots.seniority and slots.seniority in LEVEL_FILTER_APPLICABLE:
         filtered = catalog_store.filter_by_job_level(filtered, [slots.seniority])
-        logger.info(f"After job level filter ({slots.seniority}): {len(filtered)} candidates")
-
+        logger.info(
+            f"After job level filter ({slots.seniority}): {len(filtered)} candidates"
+        )
         # Safety net: if filter is too aggressive, relax it
         if len(filtered) < MIN_CANDIDATES:
             logger.warning(
@@ -241,6 +292,11 @@ async def retrieve_candidates(
                 f"Relaxing to unfiltered results."
             )
             filtered = raw_candidates
+    else:
+        logger.info(
+            f"Skipping job level filter for seniority='{slots.seniority}' "
+            f"(technical knowledge tests have sparse job level metadata)"
+        )
 
     # Test type filter — only apply if user explicitly requested specific types
     if slots.explicit_test_types:
@@ -266,6 +322,28 @@ async def retrieve_candidates(
                 filtered = type_filtered
             else:
                 logger.warning("Test type filter too restrictive, skipping")
+
+    # ── Step 4b: Re-inject current shortlist items (before BM25 cutoff) ─────────
+    # On refinement turns the agreed shortlist must survive a fresh FAISS search.
+    # A query biased toward newly-requested items (e.g. "AWS Docker") can push
+    # agreed-upon items (e.g. "Core Java", "Spring", "SQL") out of the top-40.
+    # We inject them directly into the filtered pool before BM25 so they
+    # participate in re-ranking and the top-20 cutoff.
+    if slots.current_shortlist_urls:
+        existing_urls_in_pool = {c.get("url", "") for c in filtered}
+        injected = 0
+        for url in slots.current_shortlist_urls:
+            if url in existing_urls_in_pool:
+                continue
+            item = catalog_store.get_by_url(url)
+            if item:
+                shortlist_item = dict(item)
+                shortlist_item["score"] = 0.85  # high-but-not-max; BM25 will further sort
+                filtered.append(shortlist_item)
+                existing_urls_in_pool.add(url)
+                injected += 1
+        if injected:
+            logger.info(f"Shortlist continuity: injected {injected} items into BM25 pool")
 
     # ── Step 4: BM25 re-rank ─────────────────────────────────────────────────
     reranked = bm25_rerank(list(filtered), query, slots)

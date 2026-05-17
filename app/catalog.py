@@ -1,21 +1,13 @@
 """
-Catalog loader for the SHL Assessment Recommender.
+Catalog loader and search interface for the SHL Assessment Recommender.
 
-Loads catalog metadata and the FAISS vector index once at application startup,
-then exposes a CatalogStore singleton used by the retriever and agent.
+CatalogStore holds three resources in memory after a single startup load:
+  - FAISS IndexFlatIP    — 377 assessment vectors, 384 dimensions (MiniLM-L6-v2)
+  - Metadata records     — parallel array of assessment dicts matching FAISS indices
+  - URL whitelist        — set of valid catalog URLs, used to validate every response
 
-Usage:
-    from app.catalog import catalog_store
-
-    # Search by query text
-    results = catalog_store.search_by_text("cognitive ability for graduates", k=20)
-
-    # Filter results by job level
-    filtered = catalog_store.filter_by_job_level(results, ["graduate", "entry"])
-
-    # Validate a URL before including it in a response
-    if catalog_store.is_valid_url(url):
-        ...
+All search, filter, and lookup operations go through this module.
+Nothing else in the codebase touches the data files directly.
 """
 
 import json

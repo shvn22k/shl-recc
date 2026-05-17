@@ -1,22 +1,22 @@
 """
-Agent logic for the SHL Assessment Recommender.
+Core agent logic for the SHL Assessment Recommender.
 
-ChatHandler orchestrates the full CSG-RAG pipeline for each /chat request:
+ChatHandler orchestrates the Conversational Slot-Guided RAG (CSG-RAG) pipeline:
 
-  1. Guardrail pre-check  — injection, legal, off-topic (this phase)
-  2. Turn cap check       — max 8 user turns (this phase)
-  3. Slot extraction      — LLM Call 1, extracts structured intent (Phase 4)
-  4. Metadata pre-filter  — job level / test type filter on candidates (Phase 5)
-  5. Hybrid retrieval     — FAISS semantic + BM25 keyword re-rank (Phase 5)
-  6. LLM ranker           — LLM Call 2, selects final 1-10 assessments (Phase 6)
-  7. URL whitelist        — post-processing strip of any invalid URLs (this phase)
+  1. Guardrail pre-checks  — injection, legal, off-topic, gibberish
+  2. Slot extraction       — LLM reads conversation, outputs structured intent
+  3. Routing               — clarify, retrieve, compare, or close
+  4. Hybrid retrieval      — FAISS semantic + BM25 keyword + metadata filter
+  5. LLM ranking           — chain-of-thought selection of final 1-10 assessments
+  6. Post-processing       — default injection, deduplication, URL whitelist
 
-Phases 4-6 replace the stub methods below with real implementations.
-Everything else here is final and production-ready.
+The handler is stateless — instantiated fresh per request, all context
+comes from the messages[] array in the request body.
 """
 
 import logging
 import os
+import re
 
 from app.models import AgentDecision, Message, Recommendation, SlotState
 from app.retriever import retrieve_candidates as _do_retrieve
@@ -27,14 +27,44 @@ from app.guardrails import (
     get_injection_refusal,
     get_legal_refusal,
     get_off_topic_refusal,
+    get_gibberish_redirect,
     is_injection_attempt,
     is_legal_question,
     is_off_topic,
+    is_gibberish,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = int(os.getenv("MAX_TURNS", "8"))
+
+SHL_CATALOG_URL_RE = re.compile(
+    r"https://www\.shl\.com/products/product-catalog/view/[^\s\)>\]\"']+",
+    re.IGNORECASE,
+)
+SHORTLIST_FOOTER_RE = re.compile(
+    r"\[Shortlist:\s*([^\]]+)\]",
+    re.IGNORECASE,
+)
+COMPARISON_SIGNAL_RE = re.compile(
+    r"\b(difference|compare|vs\.?|versus|how does|which is better|explain)\b",
+    re.IGNORECASE,
+)
+CLOSING_SIGNAL_RE = re.compile(
+    r"\b(confirmed|that works|that covers it|perfect|locking it in|"
+    r"thanks|thank you|final list|keep the shortlist|shortlist as-is|"
+    r"that.s good|sounds good|that.ll work|works for me|go ahead)\b",
+    re.IGNORECASE,
+)
+CONTINUATION_SIGNAL_RE = re.compile(
+    r"\b(keep (the )?shortlist|as-is|understood|go with (the )?hybrid|"
+    r"clear\.|we'll use|final list)\b",
+    re.IGNORECASE,
+)
+REFINEMENT_SIGNAL_RE = re.compile(
+    r"\b(add|drop|remove|exclude|also add|without)\b",
+    re.IGNORECASE,
+)
 
 
 class ChatHandler:
@@ -99,8 +129,18 @@ class ChatHandler:
                 end_of_conversation=False,
             )
 
-        # ── 3. Slot extraction (Phase 4) ──────────────────────────────────────
+        # Check for gibberish / empty-intent messages
+        if is_gibberish(latest):
+            return AgentDecision(
+                reply=get_gibberish_redirect(),
+                recommendations=[],
+                end_of_conversation=False,
+            )
+
+        # ── 3. Slot extraction ────────────────────────────────────────────────
         slots = await self._extract_slots(messages)
+        slots = self._normalize_slots(slots, latest)
+        slots = self._merge_recovered_shortlist(slots, messages)
 
         # ── 4. Clarification turn — return question, skip retrieval ───────────
         if slots.needs_clarification and not slots.ready_to_retrieve:
@@ -112,7 +152,11 @@ class ChatHandler:
                 end_of_conversation=False,
             )
 
-        # ── 5. Comparison turn — explain differences, no new recommendations ──
+        # ── 5. Closing turn — BEFORE comparison (sticky compare flag fix) ─────
+        if slots.end_of_conversation:
+            return await self._handle_closing_turn(messages, slots)
+
+        # ── 6. Comparison turn — explain differences, no new recommendations ──
         if slots.is_comparison_turn:
             reply = await self._handle_comparison(messages, slots)
             return AgentDecision(
@@ -121,26 +165,10 @@ class ChatHandler:
                 end_of_conversation=False,
             )
 
-        # ── 6. Closing turn — user confirmed they're done ─────────────────────
-        if slots.end_of_conversation:
-            current_recs = await self._get_current_recommendations(slots)
-            safe_recs = enforce_url_whitelist(current_recs, self.catalog_store)
-            return AgentDecision(
-                reply=self._build_closing_reply(slots),
-                recommendations=safe_recs,
-                end_of_conversation=True,
-            )
-
         # ── 7. Retrieval + ranking (Phases 5 & 6) ────────────────────────────
         candidates = await self._retrieve_candidates(slots)
         decision = await self._rank_and_respond(messages, slots, candidates)
-
-        # ── 8. Whitelist enforcement — always the last step ───────────────────
-        decision.recommendations = enforce_url_whitelist(
-            decision.recommendations, self.catalog_store
-        )
-
-        return decision
+        return self._finalize_recommendation_decision(decision, slots)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -160,22 +188,247 @@ class ChatHandler:
             "Feel free to come back if you need to reassess or explore other roles."
         )
 
+    def _normalize_slots(self, slots: SlotState, latest_user_message: str) -> SlotState:
+        """Correct common slot-extractor mistakes using the latest user message."""
+        latest = latest_user_message.lower()
+        updates: dict = {}
+
+        if slots.is_comparison_turn and not COMPARISON_SIGNAL_RE.search(latest):
+            updates["is_comparison_turn"] = False
+
+        if CLOSING_SIGNAL_RE.search(latest):
+            updates.update({
+                "end_of_conversation": True,
+                "conversation_phase": "closing",
+                "is_comparison_turn": False,
+                "needs_clarification": False,
+            })
+
+        if slots.conversation_phase in ("closing", "refining"):
+            updates["is_comparison_turn"] = False
+
+        if slots.end_of_conversation:
+            updates.update({
+                "is_comparison_turn": False,
+                "needs_clarification": False,
+            })
+
+        if (
+            not is_legal_question(latest_user_message)
+            and CONTINUATION_SIGNAL_RE.search(latest)
+        ):
+            updates.update({
+                "needs_clarification": False,
+                "ready_to_retrieve": True,
+                "is_legal_question": False,
+                "is_comparison_turn": False,
+            })
+
+        if REFINEMENT_SIGNAL_RE.search(latest) or slots.explicit_additions or slots.explicit_drops:
+            updates.update({
+                "needs_clarification": False,
+                "ready_to_retrieve": True,
+                "is_comparison_turn": False,
+            })
+
+        if updates:
+            slots = slots.model_copy(update=updates)
+        return slots
+
+    def _recover_shortlist_urls(self, messages: list[Message]) -> list[str]:
+        """Extract catalog URLs from prior assistant replies (footer + inline)."""
+        seen: set[str] = set()
+        ordered: list[str] = []
+
+        for msg in reversed(messages):
+            if msg.role != "assistant":
+                continue
+            footer = SHORTLIST_FOOTER_RE.search(msg.content)
+            if footer:
+                for part in footer.group(1).split(","):
+                    url = part.strip().rstrip("/")
+                    if self.catalog_store.is_valid_url(url) and url not in seen:
+                        seen.add(url)
+                        ordered.append(url)
+            for url in SHL_CATALOG_URL_RE.findall(msg.content):
+                url = url.rstrip("/.,;")
+                if self.catalog_store.is_valid_url(url) and url not in seen:
+                    seen.add(url)
+                    ordered.append(url)
+
+        ordered.reverse()
+        return ordered
+
+    def _merge_recovered_shortlist(self, slots: SlotState, messages: list[Message]) -> SlotState:
+        """Merge extractor URLs with URLs recovered from conversation history."""
+        recovered = self._recover_shortlist_urls(messages)
+        merged: list[str] = []
+        seen: set[str] = set()
+        for url in list(slots.current_shortlist_urls) + recovered:
+            if url and url not in seen and self.catalog_store.is_valid_url(url):
+                seen.add(url)
+                merged.append(url)
+        if merged != slots.current_shortlist_urls:
+            return slots.model_copy(update={"current_shortlist_urls": merged})
+        return slots
+
+    def _recommendations_from_urls(
+        self, urls: list[str], explicit_drops: list[str]
+    ) -> list[Recommendation]:
+        """Build recommendations from catalog URLs; honour explicit drops."""
+        recs: list[Recommendation] = []
+        for url in urls:
+            item = self.catalog_store.get_by_url(url)
+            if not item:
+                continue
+            if self._should_drop(item["name"], explicit_drops):
+                continue
+            recs.append(Recommendation(
+                name=item["name"],
+                url=item["url"],
+                test_type=self._clean_test_type(item["test_type"]),
+            ))
+        return recs
+
+    def _recover_recommendations_from_assistant_text(
+        self, messages: list[Message], explicit_drops: list[str]
+    ) -> list[Recommendation]:
+        """Match catalog assessment names mentioned in prior assistant replies."""
+        for msg in reversed(messages):
+            if msg.role != "assistant":
+                continue
+            text_lower = msg.content.lower()
+            recs: list[Recommendation] = []
+            seen_urls: set[str] = set()
+            for item in self.catalog_store.metadata:
+                name = item["name"]
+                if len(name) < 10:
+                    continue
+                if name.lower() not in text_lower:
+                    continue
+                if self._should_drop(name, explicit_drops):
+                    continue
+                if item["url"] in seen_urls:
+                    continue
+                seen_urls.add(item["url"])
+                recs.append(Recommendation(
+                    name=name,
+                    url=item["url"],
+                    test_type=self._clean_test_type(item["test_type"]),
+                ))
+            if recs:
+                logger.info(
+                    f"Recovered {len(recs)} recommendations from assistant text"
+                )
+                return recs[:10]
+        return []
+
+    async def _handle_closing_turn(
+        self, messages: list[Message], slots: SlotState
+    ) -> AgentDecision:
+        """
+        Echo the agreed shortlist on closing — no full re-rank that collapses the list.
+        """
+        latest = self._get_latest_user_message(messages)
+        if re.search(r"keep (the )?shortlist|as-is", latest, re.IGNORECASE):
+            recall_slots = slots.model_copy(
+                update={
+                    "end_of_conversation": False,
+                    "needs_clarification": False,
+                    "ready_to_retrieve": True,
+                    "is_comparison_turn": False,
+                }
+            )
+            candidates = await self._retrieve_candidates(recall_slots)
+            decision = await self._rank_and_respond(messages, recall_slots, candidates)
+            decision = self._finalize_recommendation_decision(decision, recall_slots)
+            return AgentDecision(
+                reply=decision.reply,
+                recommendations=decision.recommendations,
+                end_of_conversation=True,
+            )
+
+        current_recs = self._recommendations_from_urls(
+            slots.current_shortlist_urls, slots.explicit_drops
+        )
+
+        if not current_recs:
+            current_recs = self._recover_recommendations_from_assistant_text(
+                messages, slots.explicit_drops
+            )
+
+        if not current_recs:
+            logger.warning("Closing turn: no shortlist recovered — retrieval fallback")
+            recall_slots = slots.model_copy(
+                update={
+                    "end_of_conversation": False,
+                    "needs_clarification": False,
+                    "ready_to_retrieve": True,
+                }
+            )
+            candidates = await self._retrieve_candidates(recall_slots)
+            decision = await self._rank_and_respond(messages, recall_slots, candidates)
+            current_recs = decision.recommendations
+
+        current_recs = self._inject_defaults(
+            current_recs, slots, self.catalog_store
+        )
+        current_recs = enforce_url_whitelist(current_recs, self.catalog_store)
+
+        reply = self._append_shortlist_footer(
+            self._build_closing_reply(slots), current_recs
+        )
+        return AgentDecision(
+            reply=reply,
+            recommendations=current_recs,
+            end_of_conversation=True,
+        )
+
+    def _finalize_recommendation_decision(
+        self, decision: AgentDecision, slots: SlotState
+    ) -> AgentDecision:
+        """Defaults, whitelist, and shortlist footer for recommending/refining turns."""
+        decision.recommendations = self._inject_defaults(
+            decision.recommendations, slots, self.catalog_store
+        )
+        decision.recommendations = enforce_url_whitelist(
+            decision.recommendations, self.catalog_store
+        )
+        decision.reply = self._append_shortlist_footer(
+            decision.reply, decision.recommendations
+        )
+        return decision
+
+    @staticmethod
+    def _append_shortlist_footer(reply: str, recommendations: list[Recommendation]) -> str:
+        """Embed catalog URLs in reply so the next turn can recover the shortlist."""
+        if not recommendations:
+            return reply
+        urls = [r.url for r in recommendations]
+        footer = "[Shortlist: " + ", ".join(urls) + "]"
+        if footer in reply:
+            return reply
+        return reply.rstrip() + "\n\n" + footer
+
     # ── Stub methods — replaced in Phases 4, 5, 6 ────────────────────────────
 
     async def _extract_slots(self, messages: list[Message]) -> SlotState:
         """
-        LLM Call 1 — Slot Extractor.
+        Extract structured hiring intent from the full conversation history.
 
-        Reads the full conversation history and extracts structured intent
-        into a SlotState. Uses Gemini 2.5 Flash with JSON mode, falls back
-        to OpenAI GPT-4o-mini automatically.
+        Sends the conversation to the LLM with a structured extraction prompt.
+        Returns a SlotState describing what the hiring manager needs and what
+        the agent should do next.
 
         The SlotState drives all downstream decisions:
           needs_clarification  → return question, skip retrieval
-          ready_to_retrieve    → proceed to Phase 5 retrieval
+          ready_to_retrieve    → proceed to hybrid retrieval
           is_comparison_turn   → return explanation, no new retrieval
           end_of_conversation  → repeat shortlist, set end=true
-          explicit_additions/drops → honoured absolutely in Phase 6
+          explicit_additions/drops → honoured absolutely by the ranker
+
+        Low temperature (0.1) keeps extraction deterministic across repeated
+        calls on the same conversation.
         """
         system_prompt, user_prompt = build_slot_extractor_prompt(messages)
 
@@ -219,8 +472,9 @@ class ChatHandler:
 
     async def _retrieve_candidates(self, slots: SlotState) -> list:
         """
-        Phase 5 — Hybrid retrieval.
-        Delegates to app/retriever.py which implements:
+        Run hybrid retrieval for the given SlotState.
+
+        Delegates to app/retriever.py:
         FAISS semantic search → metadata filter → BM25 re-rank → explicit injection
         """
         return await _do_retrieve(slots, self.catalog_store)
@@ -232,10 +486,10 @@ class ChatHandler:
         candidates: list,
     ) -> AgentDecision:
         """
-        Phase 6 — LLM Ranker (Call 2).
+        LLM Call 2 — select the final 1-10 assessments from retrieved candidates.
 
-        Selects final 1-10 assessments from candidates using chain-of-thought
-        reasoning. Applies explicit_drops as a post-processing step.
+        Uses chain-of-thought reasoning to pick the best-fit assessments,
+        then applies explicit_drops as a hard post-processing filter.
         """
         from app.llm_client import call_llm_json, call_llm, LLMError
         from app.models import Recommendation
@@ -282,7 +536,9 @@ class ChatHandler:
         try:
             selected_raw = raw.get("selected_assessments", [])
             reply = raw.get("reply", "").strip()
-            end_conv = bool(raw.get("end_of_conversation", False))
+            # end_of_conversation is controlled exclusively by the slot extractor
+            # (closing signals) and turn cap — never by the ranker.
+            end_conv = False
 
             if not reply:
                 reply = "Here are the assessments I recommend for this role."
@@ -304,7 +560,7 @@ class ChatHandler:
             for item in selected_raw:
                 name = item.get("name", "").strip()
                 url = item.get("url", "").strip()
-                test_type = item.get("test_type", "").strip()
+                test_type = self._clean_test_type(item.get("test_type", ""))
 
                 # Skip duplicates
                 if url in seen_urls:
@@ -316,7 +572,7 @@ class ChatHandler:
                     match = self.catalog_store.get_by_name(name)
                     if match:
                         url = match["url"]
-                        test_type = match["test_type"]
+                        test_type = self._clean_test_type(match["test_type"])
                         logger.warning(
                             f"Ranker returned wrong URL for '{name}', "
                             f"corrected to catalog URL"
@@ -352,6 +608,31 @@ class ChatHandler:
             reply = "I found relevant assessments but encountered an issue formatting them. Please try again."
             end_conv = False
 
+        # Final deduplication — remove semantic duplicates keeping first occurrence
+        # Catches cases where ranker selects both an instrument and its report variant
+        deduplicated = []
+        seen_key_terms = []
+
+        for rec in recommendations:
+            rec_terms = [
+                t for t in rec.name.lower().split() 
+                if len(t) >= 2 and t not in {"test", "report", "assessment", "shl", "the", "for", "new", "(new)"}
+            ]
+            is_dup = False
+            for seen_terms in seen_key_terms:
+                overlap = sum(1 for t in rec_terms if t in seen_terms)
+                if overlap >= 2:
+                    logger.info(
+                        f"Dedup: removing '{rec.name}' as duplicate of earlier entry"
+                    )
+                    is_dup = True
+                    break
+            if not is_dup:
+                deduplicated.append(rec)
+                seen_key_terms.append(set(rec_terms))
+
+        recommendations = deduplicated
+
         return AgentDecision(
             reply=reply,
             recommendations=recommendations,
@@ -362,11 +643,11 @@ class ChatHandler:
         self, messages: list[Message], slots: SlotState
     ) -> str:
         """
-        Phase 6 — Comparison handler.
+        Answer a comparison or explanation question grounded in catalog data.
 
-        Fetches the relevant assessments from the catalog by URL
-        (from current_shortlist_urls) and answers the comparison
-        question grounded in catalog data only.
+        Fetches catalog records for assessments in current_shortlist_urls,
+        injects their structured metadata into the prompt, and asks the LLM
+        to compare them without inventing details.
 
         Returns plain text reply. recommendations=[] on comparison turns.
         """
@@ -412,6 +693,122 @@ class ChatHandler:
                 "could you clarify what specific dimension you'd like to compare?"
             )
 
+    def _clean_test_type(self, raw: str) -> str:
+        """
+        Strip labels from test_type, return only the code(s).
+        'K (Knowledge & Skills)' → 'K'
+        'A,C,P (Ability & Aptitude, Competencies, Personality & Behavior)' → 'A,C,P'
+        'P' → 'P'
+        """
+        if not raw:
+            return ""
+        # Take everything before the first '(' and strip whitespace/commas
+        code_part = raw.split("(")[0].strip().rstrip(",").strip()
+        return code_part
+
+    def _inject_defaults(
+        self,
+        recommendations: list,
+        slots: SlotState,
+        catalog_store,
+    ) -> list:
+        """
+        Inject OPQ32r and Verify G+ as defaults when applicable,
+        unless the user explicitly dropped them.
+
+        This runs AFTER the ranker so defaults are always present
+        regardless of whether they ranked highly in retrieval.
+        """
+        from app.models import Recommendation
+
+        existing_urls = {r.url for r in recommendations}
+        existing_names_lower = {r.name.lower() for r in recommendations}
+
+        drops_lower = [d.lower() for d in slots.explicit_drops]
+
+        def is_dropped(name: str) -> bool:
+            name_l = name.lower()
+            return any(d in name_l or name_l in d for d in drops_lower)
+
+        def maybe_append(assessment_name: str):
+            """Fetch from catalog and append if not already present and not dropped."""
+            if is_dropped(assessment_name):
+                return
+            item = catalog_store.get_by_name(assessment_name)
+            if not item:
+                return
+            if item["url"] in existing_urls:
+                return
+            
+            item_name_lower = item["name"].lower()
+            key_terms = [
+                t for t in item_name_lower.split() 
+                if len(t) >= 2 and t not in {"test", "report", "assessment", "shl", "the", "for", "new", "(new)"}
+            ]
+            import logging
+            logger = logging.getLogger(__name__)
+            
+            # If the ranker hallucinated a variant (like a report instead of the instrument),
+            # replace it with the correct default
+            for existing_name in list(existing_names_lower):
+                matches = sum(1 for t in key_terms if t in existing_name)
+                if matches >= 2:  # 2+ shared meaningful words = semantic duplicate
+                    logger.info(
+                        f"Default injection '{item['name']}' replaces "
+                        f"semantic duplicate '{existing_name}'"
+                    )
+                    for idx, r in enumerate(recommendations):
+                        if r.name.lower() == existing_name:
+                            recommendations[idx] = Recommendation(
+                                name=item["name"],
+                                url=item["url"],
+                                test_type=self._clean_test_type(item["test_type"]),
+                            )
+                            existing_urls.add(item["url"])
+                            existing_names_lower.add(item_name_lower)
+                            return
+            
+            if len(recommendations) >= 10:
+                return
+            
+            recommendations.append(Recommendation(
+                name=item["name"],
+                url=item["url"],
+                test_type=self._clean_test_type(item["test_type"]),
+            ))
+            existing_urls.add(item["url"])
+            existing_names_lower.add(item_name_lower)
+            logger.info(f"Default injection: {item['name']}")
+
+        # OPQ32r — inject for mid/senior/executive SELECTION roles and for
+        # general screening where seniority is unspecified (the ranker prompt
+        # already instructs "include OPQ32r for any mid/senior selection role").
+        OPQ_APPLICABLE_SENIORITY = {
+            "mid-professional", "senior-ic", "manager", "director", "executive",
+        }
+        OPQ_APPLICABLE_PURPOSE = {"selection", "screening", None}
+
+        seniority_ok = (
+            slots.seniority in OPQ_APPLICABLE_SENIORITY
+            or slots.seniority is None  # inject when seniority unknown + non-high-volume
+        )
+        if (
+            seniority_ok
+            and slots.purpose in OPQ_APPLICABLE_PURPOSE
+            and slots.volume != "high"
+        ):
+            maybe_append("OPQ32r")
+
+        # Verify G+ — inject for graduate and senior-IC selection
+        VERIFY_APPLICABLE_SENIORITY = {"graduate", "senior-ic"}
+        if (
+            slots.seniority in VERIFY_APPLICABLE_SENIORITY
+            and slots.purpose in {"selection", "screening", None}
+        ):
+            maybe_append("Verify Interactive G+")
+
+        return recommendations
+
     @staticmethod
     def _should_drop(name: str, explicit_drops: list[str]) -> bool:
         """
@@ -428,20 +825,10 @@ class ChatHandler:
         return False
 
     async def _get_current_recommendations(self, slots: SlotState) -> list[Recommendation]:
-        """
-        Reconstruct the current shortlist from URLs stored in slot state.
-        Used on closing turns to echo back the agreed list.
-        """
-        recs = []
-        for url in slots.current_shortlist_urls:
-            item = self.catalog_store.get_by_url(url)
-            if item:
-                recs.append(Recommendation(
-                    name=item["name"],
-                    url=item["url"],
-                    test_type=item["test_type"],
-                ))
-        return recs
+        """Reconstruct the current shortlist from URLs stored in slot state."""
+        return self._recommendations_from_urls(
+            slots.current_shortlist_urls, slots.explicit_drops
+        )
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

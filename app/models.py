@@ -2,13 +2,20 @@
 Pydantic models for the SHL Assessment Recommender.
 
 Two layers:
-  1. API schema types  (Message, Recommendation, ChatRequest, ChatResponse)
-     — the non-negotiable contract with the SHL evaluator. Field names and
-     types here must never change without a corresponding spec update.
 
-  2. Internal pipeline types  (SlotState, CandidateAssessment, AgentDecision)
-     — used within the agent pipeline and never serialised directly to the
-     API response.
+API schema types (enforced at the request/response boundary):
+  Message          — a single conversation turn with role and content
+  Recommendation   — one assessment with name, url, and test_type
+  ChatRequest      — the full messages array sent by the client
+  ChatResponse     — reply, recommendations list, and end_of_conversation flag
+
+Internal pipeline types (used within the agent, never serialized directly):
+  SlotState        — structured hiring intent extracted from conversation history
+  CandidateAssessment — a catalog assessment with its retrieval score
+  AgentDecision    — the agent's resolved output for one turn
+
+The API schema is the contract with SHL's automated evaluator.
+Field names, types, and structure must not change.
 """
 
 from typing import Literal, Optional

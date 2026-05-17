@@ -1,11 +1,13 @@
 """
 SHL Assessment Recommender — FastAPI application entry point.
 
-Responsibilities:
-  - Lifespan: load CatalogStore (FAISS index + embedding model) once at startup
-  - Middleware: CORS
-  - Global exception handlers: guarantee no unhandled error returns a non-schema body
-  - Endpoints: GET /health, POST /chat
+Exposes two endpoints:
+  GET  /health  — readiness probe, always returns {"status": "ok"}
+  POST /chat    — stateless conversational assessment recommendation
+
+The CatalogStore (FAISS index + embedding model + metadata) is loaded
+once at startup via FastAPI's lifespan handler and shared across all
+requests. No per-request model loading.
 """
 
 import logging

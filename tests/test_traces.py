@@ -197,3 +197,96 @@ async def test_closing_turn_detected():
     ))
     assert slots.end_of_conversation is True
     assert slots.conversation_phase == "closing"
+
+
+# ── End-to-end Recall@10 (live API) ───────────────────────────────────────────
+# Requires: uvicorn app.main:app --port 8000
+
+import httpx
+
+E2E_BASE_URL = "http://localhost:8000"
+E2E_TIMEOUT = 45
+
+RECALL_GROUND_TRUTH = {
+    "C2": ["Linux Programming", "Networking", "Verify", "OPQ32r"],
+    "C10": ["Verify", "Graduate Scenarios"],
+}
+
+
+def _recall_at_10(recommendations: list, ground_truth_names: list) -> float:
+    if not ground_truth_names:
+        return 1.0
+    rec_names_lower = [r["name"].lower() for r in recommendations]
+    hits = 0
+    for gt_name in ground_truth_names:
+        gt_lower = gt_name.lower()
+        if any(
+            gt_lower in rec_lower or rec_lower in gt_lower
+            for rec_lower in rec_names_lower
+        ):
+            hits += 1
+    return hits / len(ground_truth_names)
+
+
+def _server_available() -> bool:
+    try:
+        r = httpx.get(f"{E2E_BASE_URL}/health", timeout=5)
+        return r.status_code == 200 and r.json() == {"status": "ok"}
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="module")
+def require_live_server():
+    if not _server_available():
+        pytest.skip("Live API not running on localhost:8000")
+
+
+@pytest.mark.integration
+def test_recall_c10_graduate_trainee(require_live_server):
+    """C10 rich query — Verify G+ and Graduate Scenarios should appear."""
+    r = httpx.post(
+        f"{E2E_BASE_URL}/chat",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "We run a graduate management trainee scheme. Full battery — "
+                    "cognitive, personality, and situational judgement."
+                ),
+            }]
+        },
+        timeout=E2E_TIMEOUT,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    recall = _recall_at_10(data["recommendations"], RECALL_GROUND_TRUTH["C10"])
+    assert recall >= 0.5, (
+        f"C10 Recall@10 too low ({recall:.2f}). "
+        f"Got: {[x['name'] for x in data['recommendations']]}"
+    )
+
+
+@pytest.mark.integration
+def test_recall_c2_senior_rust_engineer(require_live_server):
+    """C2 tech role — Linux/Networking/Verify/OPQ proxies should surface."""
+    r = httpx.post(
+        f"{E2E_BASE_URL}/chat",
+        json={
+            "messages": [{
+                "role": "user",
+                "content": (
+                    "I'm hiring a senior Rust engineer for high-performance "
+                    "networking infrastructure. What assessments should I use?"
+                ),
+            }]
+        },
+        timeout=E2E_TIMEOUT,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    recall = _recall_at_10(data["recommendations"], RECALL_GROUND_TRUTH["C2"])
+    assert recall >= 0.5, (
+        f"C2 Recall@10 too low ({recall:.2f}). "
+        f"Got: {[x['name'] for x in data['recommendations']]}"
+    )
